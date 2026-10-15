@@ -36,7 +36,7 @@ The two macOS slices are released apart; nettai's macOS packaging joins them int
 
 Download URLs are stable, e.g.
 `https://github.com/bigfarts/nettai-ffmpeg-build/releases/download/ffmpeg-9.0.2-1/ffmpeg-linux-x86_64`. nettai
-pins a release by its tag and each binary by its SHA-256 (`packaging/ffmpeg.sh` in nettai).
+pins a release by its tag and each file it takes by its SHA-256 (`packaging/ffmpeg.sha256` in nettai).
 
 ## What's enabled, and why
 
