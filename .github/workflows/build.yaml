@@ -1,0 +1,326 @@
+# Builds the minimal static ffmpeg nettai bundles, for every platform nettai's
+# release packages:
+#   - Linux x86_64    built on ubuntu-22.04, linked fully statically
+#   - Windows x86_64  MSVC, static CRT: needs no DLL beyond Windows' own
+#   - macOS arm64     native, for macOS 11 and later
+#   - macOS x86_64    cross-compiled on the same arm64 runner, smoke-tested
+#                     under Rosetta. The two slices are released apart;
+#                     nettai's macOS packaging joins them with lipo.
+#
+# Run by hand (Actions -> build-ffmpeg -> Run workflow). Each binary has only
+# what nettai's replay export runs (scripts/ffmpeg-config-common.sh), and is
+# smoke-tested with nettai's exact command on streams nettai's NUT writer
+# made; a last job decodes every platform's MP4s with a full ffmpeg. Then a
+# GitHub Release tagged ffmpeg-<version>-<revision> is published with the
+# binaries, a .sha256 each, the source tarballs they were built from, this
+# repository's scripts, and the license texts (the binaries are GPL).
+name: build-ffmpeg
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: "FFmpeg release to build (a version ffmpeg.org/releases has)"
+        required: true
+        default: "9.0.2"
+      revision:
+        description: "The build's number for that version: the release is ffmpeg-<version>-<revision>"
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ffmpeg
+  cancel-in-progress: false
+
+env:
+  FFMPEG_VERSION: ${{ inputs.ffmpeg_version }}
+
+jobs:
+  # The sources every platform builds from, fetched once (so each builds the
+  # same bytes, and the release carries exactly those), and the NUT streams
+  # the smoke tests feed it.
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          [[ "$FFMPEG_VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "not a release version: $FFMPEG_VERSION" >&2; exit 1; }
+          [[ "$REVISION" =~ ^[1-9][0-9]*$ ]] || { echo "not a revision: $REVISION" >&2; exit 1; }
+          tag="ffmpeg-$FFMPEG_VERSION-$REVISION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag is released already: give another revision" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Fetch the sources
+        run: scripts/fetch-sources.sh sources
+      - name: Make the smoke test's streams (nettai's NUT writer)
+        run: scripts/make-streams.sh streams
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sources
+          path: sources
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: streams
+          path: streams
+          if-no-files-found: error
+
+  linux-x86_64:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: sources
+          path: sources
+      - uses: actions/download-artifact@v8
+        with:
+          name: streams
+          path: streams
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential nasm pkg-config
+      # (-static: one file that runs on any x86_64 Linux, whatever its C
+      # library; with no network and no devices nothing needs glibc's dynamic
+      # parts.)
+      - name: Build x264 and ffmpeg
+        env:
+          PREFIX: ${{ github.workspace }}/prefix
+          OUTPUT: ${{ github.workspace }}/out/ffmpeg-linux-x86_64
+          EXTRA_LDFLAGS: -static
+        run: |
+          scripts/build-x264.sh
+          scripts/build-ffmpeg.sh
+      - name: Smoke test
+        run: scripts/smoke-test.sh out/ffmpeg-linux-x86_64 streams mp4s
+      - name: Dependencies, size and checksum
+        run: |
+          file out/ffmpeg-linux-x86_64
+          ldd out/ffmpeg-linux-x86_64 || true
+          ls -l out/ffmpeg-linux-x86_64
+          (cd out && sha256sum ffmpeg-linux-x86_64 > ffmpeg-linux-x86_64.sha256)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-linux-x86_64
+          path: out/ffmpeg-linux-x86_64*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mp4s-linux-x86_64
+          path: mp4s
+          if-no-files-found: error
+
+  # FFmpeg's "Compiling FFmpeg with MSVC": MSYS2 gives bash, make and nasm;
+  # the compiler is MSVC's cl.exe and link.exe (--toolchain=msvc). x264 and
+  # ffmpeg both link the static CRT (-MT), so the program needs no
+  # redistributable.
+  windows-x86_64:
+    needs: prepare
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: sources
+          path: sources
+      - uses: actions/download-artifact@v8
+        with:
+          name: streams
+          path: streams
+      # cl.exe, link.exe, lib.exe and the Windows SDK on PATH, with INCLUDE
+      # and LIB, which the MSYS2 shell inherits.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
+        with:
+          msystem: MSYS
+          update: true
+          path-type: inherit
+          install: >-
+            make diffutils nasm pkgconf tar bzip2 xz grep
+      - name: Build x264 and ffmpeg with MSVC
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          # (MSYS2's /usr/bin/link.exe, a coreutil, would shadow MSVC's.)
+          rm -f /usr/bin/link.exe
+          export CC=cl
+          export PREFIX="$PWD/prefix"
+          export EXTRA_CFLAGS="-MT"
+          scripts/build-x264.sh
+          export OUTPUT="$PWD/out/ffmpeg-windows-x86_64.exe"
+          export EXE_SUFFIX=".exe"
+          export PREFIX_CFLAGS="-I$PREFIX/include"
+          # (link.exe takes no -L: x264 is found through pkg-config.)
+          export PREFIX_LDFLAGS=""
+          export FFMPEG_EXTRA="--toolchain=msvc --arch=x86_64 --disable-stripping"
+          scripts/build-ffmpeg.sh
+      - name: Smoke test
+        shell: msys2 {0}
+        run: scripts/smoke-test.sh out/ffmpeg-windows-x86_64.exe streams mp4s
+      - name: Dependencies, size and checksum
+        shell: msys2 {0}
+        run: |
+          ldd out/ffmpeg-windows-x86_64.exe || true
+          ls -l out/ffmpeg-windows-x86_64.exe
+          (cd out && sha256sum ffmpeg-windows-x86_64.exe > ffmpeg-windows-x86_64.exe.sha256)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-windows-x86_64
+          path: out/ffmpeg-windows-x86_64.exe*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mp4s-windows-x86_64
+          path: mp4s
+          if-no-files-found: error
+
+  macos:
+    needs: prepare
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            host: ""
+            cross: ""
+          - arch: x86_64
+            host: x86_64-apple-darwin
+            cross: --enable-cross-compile --arch=x86_64 --target-os=darwin
+    env:
+      # nettai's LSMinimumSystemVersion.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: sources
+          path: sources
+      - uses: actions/download-artifact@v8
+        with:
+          name: streams
+          path: streams
+      - name: Build tools
+        run: brew install nasm
+      - name: Build x264 and ffmpeg (${{ matrix.arch }})
+        env:
+          PREFIX: ${{ github.workspace }}/prefix
+          OUTPUT: ${{ github.workspace }}/out/ffmpeg-macos-${{ matrix.arch }}
+          EXTRA_CFLAGS: -arch ${{ matrix.arch }} -mmacosx-version-min=11.0
+          EXTRA_LDFLAGS: -arch ${{ matrix.arch }} -mmacosx-version-min=11.0
+          X264_HOST: ${{ matrix.host }}
+          FFMPEG_EXTRA: ${{ matrix.cross }}
+        run: |
+          scripts/build-x264.sh
+          scripts/build-ffmpeg.sh
+      - name: Rosetta
+        if: matrix.arch == 'x86_64'
+        run: arch -x86_64 /usr/bin/true || softwareupdate --install-rosetta --agree-to-license
+      - name: Smoke test
+        run: scripts/smoke-test.sh "out/ffmpeg-macos-${{ matrix.arch }}" streams mp4s
+      - name: Architecture, dependencies, size and checksum
+        run: |
+          file "out/ffmpeg-macos-${{ matrix.arch }}"
+          lipo -archs "out/ffmpeg-macos-${{ matrix.arch }}" | grep -qx "${{ matrix.arch }}"
+          otool -L "out/ffmpeg-macos-${{ matrix.arch }}"
+          ls -l "out/ffmpeg-macos-${{ matrix.arch }}"
+          (cd out && shasum -a 256 "ffmpeg-macos-${{ matrix.arch }}" > "ffmpeg-macos-${{ matrix.arch }}.sha256")
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-macos-${{ matrix.arch }}
+          path: out/ffmpeg-macos-${{ matrix.arch }}*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mp4s-macos-${{ matrix.arch }}
+          path: mp4s
+          if-no-files-found: error
+
+  # Every platform's MP4s, decoded by a full ffmpeg (the minimal one decodes
+  # no H.264 or AAC).
+  verify:
+    needs: [linux-x86_64, windows-x86_64, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: streams
+          path: streams
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: mp4s-*
+          path: mp4s
+      - name: A full ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+      - name: Decode and check every MP4
+        run: scripts/verify-mp4s.sh streams mp4s/*
+
+  release:
+    needs: [prepare, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ffmpeg-*
+          path: release
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: sources
+          path: sources
+      # What the GPL asks of whoever distributes the binaries: the source
+      # they were built from (the tarballs, and the scripts that configure
+      # and build them), and the license texts.
+      - name: Sources, scripts, licenses and notice
+        run: |
+          scripts_tarball="nettai-ffmpeg-build-${GITHUB_SHA::12}.tar.gz"
+          git archive --format=tar.gz --prefix="nettai-ffmpeg-build-${GITHUB_SHA::12}/" -o "release/$scripts_tarball" HEAD
+          cp sources/* release/
+          tar -xJOf "sources/ffmpeg-$FFMPEG_VERSION.tar.xz" "ffmpeg-$FFMPEG_VERSION/LICENSE.md" > release/FFmpeg-LICENSE.md
+          tar -xJOf "sources/ffmpeg-$FFMPEG_VERSION.tar.xz" "ffmpeg-$FFMPEG_VERSION/COPYING.GPLv2" > release/FFmpeg-COPYING.GPLv2
+          x264="$(cd sources && ls x264-*.tar.bz2)"
+          tar -xjOf "sources/$x264" "${x264%.tar.bz2}/COPYING" > release/x264-COPYING
+          scripts/notice.sh sources "$TAG" "$scripts_tarball" > release/ffmpeg-NOTICE.txt
+          (cd release && sha256sum ffmpeg-NOTICE.txt > ffmpeg-NOTICE.txt.sha256)
+          ls -l release
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Minimal static FFmpeg $FFMPEG_VERSION for nettai: only what nettai's replay export runs (see the README)."
+            echo
+            echo "Licensed GPL-2.0-or-later as a whole (built with --enable-gpl and libx264). The source tarballs these"
+            echo "binaries were built from, this repository's scripts, and the license texts are attached;"
+            echo "ffmpeg-NOTICE.txt says what is what, and is the notice nettai ships beside the program."
+            echo
+            echo '```'
+            (cd release && sha256sum ffmpeg-linux-x86_64 ffmpeg-windows-x86_64.exe ffmpeg-macos-arm64 ffmpeg-macos-x86_64 ffmpeg-NOTICE.txt ./*.tar.*)
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "FFmpeg $FFMPEG_VERSION for nettai ($TAG)" --notes-file notes.md
