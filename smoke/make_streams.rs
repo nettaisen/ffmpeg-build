@@ -1,32 +1,31 @@
-//! Writes the NUT streams the smoke test feeds the built ffmpeg, with nettai's
-//! own writer: `nut.rs` beside this file is nettai's
-//! `crates/nettai-video/src/nut.rs`, fetched at a pinned commit by
-//! `scripts/make-streams.sh`, so the bytes are the ones nettai pipes to ffmpeg
-//! when it exports a replay (one syncpoint a frame, the GBA frame's exact time
-//! base, `RGB[24]` pictures and `PFD[32]` sound, the index at the end).
+//! Writes the raw inputs the smoke test feeds the built ffmpeg: what nettai
+//! writes to its children's standard inputs as it exports a replay
+//! (crates/nettai-video/src/ffmpeg.rs). The picture's child is given RGB
+//! frames, 8 bits a color, rows from the top, one after another; a sound
+//! track's child is given its samples at 48 kHz, 32-bit little-endian floats,
+//! left then right.
 //!
 //! Usage: `make-streams DIR` writes into DIR:
 //!
-//! - `sound.nut`: 120 frames (two seconds) at twice the frame's 240x160, with
-//!   sound, as nettai's export writes a replay at scale 2;
-//! - `silent.nut`: 30 frames at three times the frame (an odd scale, where
-//!   4:2:0's color samples straddle the game's pixels), with no sound, as
-//!   nettai writes a replay whose game was loaded without its sound.
+//! - `sound.rgb` and `sound.f32`: 120 frames (two seconds) at twice the frame's
+//!   240x160, and the sound of those frames (as many samples as take it to the
+//!   last frame's end: 96,437), as nettai's export writes a replay at scale 2;
+//! - `silent.rgb`: 30 frames at three times the frame (an odd scale, where
+//!   4:2:0's color samples straddle the game's pixels), as nettai writes a
+//!   replay whose game was loaded without its sound.
 //!
 //! The pictures are flat tiles of saturated color with a white square moving
 //! over them (sharp edges, like the game's), the sound a tone in each ear.
 
-mod nut;
-
 use std::f32::consts::TAU;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 /// A tick's length in seconds (nettai_frontend::player::TICK_SECONDS), and the
-/// sound's sample rate (nettai_audio::SAMPLE_RATE).
-const TICK_SECONDS: (u32, u32) = (4389, 262_144);
-const SAMPLE_RATE: u32 = 32_768;
+/// rate the sound is given at (nettai-video's resample::RATE).
+const TICK_SECONDS: (u64, u64) = (4389, 262_144);
+const SAMPLE_RATE: u64 = 48_000;
 
 /// The game's frame.
 const WIDTH: usize = 240;
@@ -46,19 +45,20 @@ const PALETTE: [[u8; 3]; 8] = [
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: make-streams DIR");
     let dir = Path::new(&dir);
-    write(&dir.join("sound.nut"), 2, 120, true);
-    write(&dir.join("silent.nut"), 3, 30, false);
+    pictures(&dir.join("sound.rgb"), 2, 120);
+    sound(&dir.join("sound.f32"), 120);
+    pictures(&dir.join("silent.rgb"), 3, 30);
 }
 
-fn write(path: &Path, scale: usize, frames: u32, sound: bool) {
+fn create(path: &Path) -> BufWriter<File> {
+    BufWriter::new(File::create(path).expect("the file"))
+}
+
+/// `frames` frames at `scale` times the frame.
+fn pictures(path: &Path, scale: usize, frames: u32) {
     let (width, height) = (WIDTH * scale, HEIGHT * scale);
-    let video = nut::Video { width: width as u32, height: height as u32, frame_time: TICK_SECONDS };
-    let audio = sound.then_some(nut::Audio { sample_rate: SAMPLE_RATE });
-    let out = BufWriter::new(File::create(path).expect("the stream's file"));
-    let mut stream = nut::Writer::new(out, video, audio).expect("the stream's headers");
+    let mut out = create(path);
     let mut rgb = vec![0u8; width * height * 3];
-    let mut samples = Vec::new();
-    let mut heard = 0u64;
     for frame in 0..frames {
         // A tile is 8 game pixels square; the square is 16, moving 2 a frame.
         let (sx, sy) = ((frame as usize * 2) % (WIDTH - 16), (frame as usize) % (HEIGHT - 16));
@@ -73,18 +73,20 @@ fn write(path: &Path, scale: usize, frames: u32, sound: bool) {
                 rgb[(y * width + x) * 3..][..3].copy_from_slice(&color);
             }
         }
-        // The tick's samples: as many as take the sound to the tick's end.
-        samples.clear();
-        if sound {
-            let (num, den) = (TICK_SECONDS.0 as u64, TICK_SECONDS.1 as u64);
-            let until = (frame as u64 + 1) * SAMPLE_RATE as u64 * num / den;
-            while heard < until {
-                let t = heard as f32 / SAMPLE_RATE as f32;
-                samples.push([0.25 * (TAU * 440.0 * t).sin(), 0.25 * (TAU * 660.0 * t).sin()]);
-                heard += 1;
-            }
-        }
-        stream.frame(&rgb, &samples).expect("a frame");
+        out.write_all(&rgb).expect("a frame");
     }
-    stream.finish().expect("the stream's end");
+    out.flush().expect("the file's end");
+}
+
+/// The sound of `frames` frames: as many samples as take it to the last frame's end.
+fn sound(path: &Path, frames: u64) {
+    let mut out = create(path);
+    let samples = frames * SAMPLE_RATE * TICK_SECONDS.0 / TICK_SECONDS.1;
+    for n in 0..samples {
+        let t = n as f32 / SAMPLE_RATE as f32;
+        for v in [0.25 * (TAU * 440.0 * t).sin(), 0.25 * (TAU * 660.0 * t).sin()] {
+            out.write_all(&v.to_le_bytes()).expect("a sample");
+        }
+    }
+    out.flush().expect("the file's end");
 }

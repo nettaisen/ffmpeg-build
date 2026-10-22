@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Run the built ffmpeg exactly as nettai runs it (crates/nettai-video/src/mp4.rs,
-# Settings::arguments) on NUT streams nettai's writer made
+# Run the built ffmpeg exactly as nettai runs it (crates/nettai-video/src/ffmpeg.rs:
+# picture_arguments and sound_arguments) on the raw inputs nettai writes
 # (scripts/make-streams.sh), so a build missing anything nettai's export needs
-# fails here and not in a player's export. What it checks: ffmpeg ends well
-# and says nothing at -loglevel error, writes the MP4 to the .part name it is
-# given (nettai renames it when ffmpeg is done), and puts the index before the
-# media (+faststart). The MP4s are left in OUT_DIR for
-# scripts/verify-mp4s.sh, which decodes them with a full ffmpeg.
+# fails here and not in a player's export. nettai runs a child a track, each
+# reading its track's raw bytes on its standard input and writing a fragmented
+# MP4 of it on its standard output; here each child's input is a file
+# redirected in and its output a file redirected out. What it checks: ffmpeg
+# ends well and says nothing at -loglevel error, and writes a fragmented MP4
+# whose index (its moov, with the track's edit list: delay_moov) comes before
+# its first fragment. The MP4s are left in OUT_DIR for scripts/verify-mp4s.sh,
+# which decodes them with a full ffmpeg.
 #
 # Usage: smoke-test.sh /path/to/ffmpeg[.exe] STREAMS_DIR OUT_DIR
 set -euo pipefail
@@ -23,46 +26,63 @@ cd "$OUT"
 
 echo "== $("$FF" -hide_banner -version | head -n1) =="
 
-# nettai's command for one MP4: Settings::arguments with the chroma's format,
-# the CRF and the audio bit rate given (16 and 192 are nettai's defaults).
-encode() {
-  local stream="$1" name="$2" format="$3" crf="$4" kbps="$5"
-  local filter="scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int+area,format=$format,setparams=color_primaries=bt709:color_trc=bt709"
-  local args=(
-    -hide_banner -nostdin -loglevel error
-    -f nut -i pipe:0
-    -vf "$filter"
-    -c:v libx264 -preset medium -tune animation -crf "$crf"
-    -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv
-    -c:a aac -b:a "${kbps}k" -ar 48000
-    -movflags +faststart -f mp4 -y "$name.part"
-  )
-  echo "+ ffmpeg ${args[*]} < $stream"
-  rm -f "$name" "$name.part"
+# The fragmented MP4 every child writes on its standard output.
+QUIET=(-hide_banner -nostdin -loglevel error)
+
+# One child: its arguments, its input, the MP4 it writes.
+run() {
+  local input="$1" name="$2"
+  shift 2
+  echo "+ ffmpeg $* < $input > $name"
+  rm -f "$name"
   local said
-  if ! said="$("$FF" "${args[@]}" < "$STREAMS/$stream" 2>&1)"; then
-    echo "FAIL: ffmpeg failed on $stream:" >&2
+  if ! said="$("$FF" "$@" < "$STREAMS/$input" 2>&1 > "$name")"; then
+    echo "FAIL: ffmpeg failed on $input:" >&2
     echo "$said" >&2
     exit 1
   fi
   [ -z "$said" ] || { echo "FAIL: ffmpeg said, at -loglevel error:" >&2; echo "$said" >&2; exit 1; }
-  [ -s "$name.part" ] || { echo "FAIL: no $name.part" >&2; exit 1; }
-  mv "$name.part" "$name"
-  # +faststart: the moov box (the index) before the mdat box (the media).
-  local moov mdat
+  [ -s "$name" ] || { echo "FAIL: no $name" >&2; exit 1; }
+  # Fragmented, its index first: a moov, then a moof (a fragment) and its mdat.
+  local moov moof
   moov="$(grep -aobF moov "$name" | head -n1 | cut -d: -f1)"
-  mdat="$(grep -aobF mdat "$name" | head -n1 | cut -d: -f1)"
-  [ -n "$moov" ] && [ -n "$mdat" ] || { echo "FAIL: $name has no moov or no mdat box" >&2; exit 1; }
-  [ "$moov" -lt "$mdat" ] || { echo "FAIL: $name's moov is after its mdat (+faststart not done)" >&2; exit 1; }
-  printf 'ok  %-20s %9s bytes, moov at %s, mdat at %s\n' "$name" "$(wc -c < "$name" | tr -d ' ')" "$moov" "$mdat"
+  moof="$(grep -aobF moof "$name" | head -n1 | cut -d: -f1)"
+  [ -n "$moov" ] && [ -n "$moof" ] || { echo "FAIL: $name has no moov or no moof box" >&2; exit 1; }
+  [ "$moov" -lt "$moof" ] || { echo "FAIL: $name's moov is after its first fragment" >&2; exit 1; }
+  printf 'ok  %-24s %9s bytes, moov at %s, first fragment at %s\n' "$name" "$(wc -c < "$name" | tr -d ' ')" "$moov" "$moof"
 }
 
-# A replay with sound at twice the frame, as exported by default (4:2:0)...
-encode sound.nut sound-yuv420p.mp4 yuv420p 16 192
+# The picture's child (picture_arguments) with the chroma's format and the CRF
+# given (16 is nettai's default), at the size given.
+picture() {
+  local input="$1" name="$2" size="$3" format="$4" crf="$5"
+  local filter="scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int+area,format=$format,setparams=color_primaries=bt709:color_trc=bt709"
+  run "$input" "$name" "${QUIET[@]}" \
+    -f rawvideo -pixel_format rgb24 -video_size "$size" -framerate 262144/4389 -i pipe:0 \
+    -vf "$filter" \
+    -c:v libx264 -preset medium -tune animation -crf "$crf" -g 120 \
+    -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
+    -f mp4 -movflags +frag_keyframe+empty_moov+delay_moov+default_base_moof -frag_duration 2000000 pipe:1
+}
+
+# A sound track's child (sound_arguments) with the bit rate given (192 is
+# nettai's default).
+sound() {
+  local input="$1" name="$2" kbps="$3"
+  run "$input" "$name" "${QUIET[@]}" \
+    -f f32le -sample_rate 48000 -ch_layout stereo -i pipe:0 \
+    -c:a aac -b:a "${kbps}k" \
+    -f mp4 -movflags +empty_moov+delay_moov+default_base_moof -frag_duration 2000000 pipe:1
+}
+
+# A replay at twice the frame, as exported by default (4:2:0)...
+picture sound.rgb picture-yuv420p.mp4 480x320 yuv420p 16
 # ...with Chroma::Full (4:4:4)...
-encode sound.nut sound-yuv444p.mp4 yuv444p 16 192
-# ...and one without sound, at an odd scale (the audio options stand, with no
-# sound to apply them to), with another CRF and bit rate.
-encode silent.nut silent-yuv420p.mp4 yuv420p 23 128
+picture sound.rgb picture-yuv444p.mp4 480x320 yuv444p 16
+# ...and at an odd scale, with another CRF.
+picture silent.rgb picture-odd-yuv420p.mp4 720x480 yuv420p 23
+# Its sound, at the default bit rate and another.
+sound sound.f32 sound-192k.mp4 192
+sound sound.f32 sound-128k.mp4 128
 
 echo "SMOKE TEST PASSED"

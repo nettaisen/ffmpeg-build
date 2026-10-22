@@ -3,11 +3,13 @@
 Builds of a **minimal static `ffmpeg`** for [nettai](https://github.com/bigfarts/nettai), which bundles it in
 every package so a replay can be exported as video with nothing else installed.
 
-nettai links no FFmpeg library. Its replay export (`crates/nettai-video`'s `mp4` module, run by the app and by
-`nettai-tool --mp4`) writes the replay as a NUT stream of raw frames and PCM sound into the standard input of an
-`ffmpeg` child, which writes the MP4. This repository builds that program for every platform nettai's release
-packages, with what that one command needs and nothing more: configure starts from `--disable-everything` and
-each component is enabled again, traced to nettai's command. The user's request: "it should support whatever
+nettai links no FFmpeg library. Its replay export (`crates/nettai-video`'s `ffmpeg` module, run by the app and by
+`nettai-tool --mp4`) runs an `ffmpeg` child a track: one for the picture, written the replay's raw RGB frames on
+its standard input, and one for each sound track, written its raw samples. Each writes a fragmented MP4 of its
+track on its standard output, which nettai reads back and puts together into the MP4 itself. This repository
+builds that program for every platform nettai's release packages, with what those two commands need and nothing
+more: configure starts from `--disable-everything` and each component is enabled again, traced to nettai's
+commands. The user's request: "it should support whatever
 nettai needs and nothing more so the build is minimal", built "with a separate workflow ... so you don't have
 to build ffmpeg every time".
 
@@ -35,44 +37,50 @@ The two macOS slices are released apart; nettai's macOS packaging joins them int
 `lipo` (and an arm64-only local package takes the arm64 slice alone).
 
 Download URLs are stable, e.g.
-`https://github.com/bigfarts/nettai-ffmpeg-build/releases/download/ffmpeg-9.0.2-1/ffmpeg-linux-x86_64`. nettai
+`https://github.com/nettaisen/ffmpeg-build/releases/download/ffmpeg-9.0.2-2/ffmpeg-linux-x86_64`. nettai
 pins a release by its tag and each file it takes by its SHA-256 (`packaging/ffmpeg.sha256` in nettai).
 
 ## What's enabled, and why
 
-nettai's command (`crates/nettai-video/src/mp4.rs`, `Settings::arguments`):
+nettai's commands (`crates/nettai-video/src/ffmpeg.rs`, `picture_arguments` and `sound_arguments`):
 
 ```text
-ffmpeg -hide_banner -nostdin -loglevel error -f nut -i pipe:0
+ffmpeg -hide_banner -nostdin -loglevel error
+       -f rawvideo -pixel_format rgb24 -video_size WxH -framerate 262144/4389 -i pipe:0
        -vf scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int+area,format=yuv420p,setparams=color_primaries=bt709:color_trc=bt709
-       -c:v libx264 -preset medium -tune animation -crf 16
+       -c:v libx264 -preset medium -tune animation -crf 16 -g 120
        -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv
-       -c:a aac -b:a 192k -ar 48000
-       -movflags +faststart -f mp4 -y FILE.mp4.part
+       -f mp4 -movflags +frag_keyframe+empty_moov+delay_moov+default_base_moof -frag_duration 2000000 pipe:1
+
+ffmpeg -hide_banner -nostdin -loglevel error
+       -f f32le -sample_rate 48000 -ch_layout stereo -i pipe:0
+       -c:a aac -b:a 192k
+       -f mp4 -movflags +empty_moov+delay_moov+default_base_moof -frag_duration 2000000 pipe:1
 ```
 
-with `format=yuv444p` for `Chroma::Full`, and other CRFs and audio bit rates by its settings. The stream is
-`RGB[24]` video (8-bit RGB at the GBA frame's exact time base, 4389/262144 s) and, where the game has sound,
-`PFD[32]` audio (32-bit float stereo at 32768 Hz). nettai asks ffmpeg nothing else (no `-version`, no probing).
+with `format=yuv444p` for `Chroma::Full`, and other CRFs and audio bit rates by its settings. The picture is
+8-bit RGB at the GBA frame's exact rate (262144/4389 a second); the sound is 32-bit float stereo at 48 kHz, which
+nettai resamples to itself (from the GBA's 32768 Hz). nettai asks ffmpeg nothing else (no `-version`, no
+probing).
 
 The one place the components are named is [`scripts/ffmpeg-config-common.sh`](scripts/ffmpeg-config-common.sh):
 
 | Component                            | nettai's use                                                                   |
 | ------------------------------------ | ------------------------------------------------------------------------------ |
-| demuxer `nut`                        | `-f nut -i pipe:0`: the stream nettai writes                                   |
-| decoder `rawvideo`                   | the stream's `RGB[24]` pictures                                                |
-| decoder `pcm_f32le`                  | the stream's `PFD[32]` sound                                                   |
-| protocol `pipe`                      | `-i pipe:0`                                                                    |
-| protocol `file`                      | the MP4 at `FILE.mp4.part`, written by ffmpeg (`+faststart` rewrites it)       |
+| demuxer `rawvideo`                   | `-f rawvideo -i pipe:0`: the picture's frames                                  |
+| demuxer `pcm_f32le`                  | `-f f32le -i pipe:0`: a sound track's samples                                  |
+| decoder `rawvideo`                   | the frames' RGB                                                                |
+| decoder `pcm_f32le`                  | the samples' floats                                                            |
+| protocol `pipe`                      | `-i pipe:0` and `pipe:1`: nettai writes the file itself                        |
 | filter `scale` (swscale)             | `scale=out_color_matrix=bt709:out_range=tv:flags=…`: RGB to BT.709 TV-range YUV |
 | filter `format`                      | `format=yuv420p` (or `yuv444p`)                                                |
 | filter `setparams`                   | `setparams=color_primaries=bt709:color_trc=bt709`: FFmpeg 9.0's encoder takes the primaries and transfer from the frames, and with `-color_primaries`/`-color_trc` alone the MP4 says "unknown" |
-| filter `aresample` (swresample)      | `-ar 48000`: 32768 Hz to 48 kHz                                                |
-| filter `aformat`                     | float to the planar float AAC takes, inserted by ffmpeg                        |
+| filter `aresample` (swresample)      | the float samples made the planar floats AAC takes, inserted by ffmpeg (nothing is resampled) |
+| filter `aformat`                     | the formats AAC takes, inserted by ffmpeg                                      |
 | filters `null`, `anull`              | the pass-through ends of a stream's graph where it has no filter of its own   |
 | encoder `libx264`                    | `-c:v libx264 -preset medium -tune animation -crf 16`                          |
 | encoder `aac`                        | `-c:a aac -b:a 192k`                                                           |
-| muxer `mp4` (movenc)                 | `-f mp4 -movflags +faststart`                                                  |
+| muxer `mp4` (movenc)                 | `-f mp4 -movflags +…`: a fragmented MP4 on the pipe                            |
 | external library `libx264` (`--enable-gpl`) | the H.264 encoder; it makes the binary GPL                              |
 
 Configure adds what these need by itself: the `ffmpeg` program brings its filter graph's ends and the filters
@@ -86,23 +94,21 @@ hardware API; no `ffprobe` or `ffplay`. x264 is built 8-bit only, with every chr
 ## Tests
 
 Each platform's binary is **smoke-tested** ([`scripts/smoke-test.sh`](scripts/smoke-test.sh)) with nettai's
-exact command on NUT streams made by nettai's own writer: `crates/nettai-video/src/nut.rs` at a pinned nettai
-commit, compiled with [`smoke/make_streams.rs`](smoke/make_streams.rs) by
-[`scripts/make-streams.sh`](scripts/make-streams.sh): two seconds at twice the frame with sound, encoded in
-4:2:0 and in 4:4:4, and a picture-only stream at three times the frame. ffmpeg must end well, say nothing at
-`-loglevel error`, write the `.part` file it is given, and put the index before the media. Then
+exact commands on the raw bytes nettai writes, made by [`smoke/make_streams.rs`](smoke/make_streams.rs)
+([`scripts/make-streams.sh`](scripts/make-streams.sh)): two seconds of frames at twice the frame, encoded in
+4:2:0 and in 4:4:4, a second at three times the frame, and their sound at two bit rates. ffmpeg must end well,
+say nothing at `-loglevel error`, and write a fragmented MP4 whose index comes before its first fragment. Then
 [`scripts/verify-mp4s.sh`](scripts/verify-mp4s.sh) decodes every platform's MP4s with the runner's full ffmpeg
-and checks them: H.264 of every frame at the stream's size and frame rate, the pixel format asked for, tagged
-BT.709 TV range; AAC at 48 kHz stereo where there was sound and no sound where there was none; every packet
-decoding without an error; the picture close to the stream's (PSNR against the stream put through the same
-conversion); the sound not silence. A release is published only when all of it passes.
+and checks them: H.264 of every frame at the input's size and frame rate, the pixel format asked for, tagged
+BT.709 TV range, the picture close to the input's (PSNR against the input put through the same conversion);
+AAC at 48 kHz stereo, as many samples as it was given once its edit list leaves the encoder's delay out, not
+silence; every packet decoding without an error. A release is published only when all of it passes.
 
 ## Versions
 
 - **FFmpeg**: the `ffmpeg_version` input, 9.0.2 by default (`FFMPEG_VERSION` in
   `scripts/ffmpeg-config-common.sh`): a release's tarball from ffmpeg.org, never "the latest".
 - **x264**: the commit `X264_COMMIT` (the head of its `stable` branch on 2026-10-14); x264 has no release tags.
-- **The smoke test's streams**: nettai's commit `NETTAI_REF`.
 
 ## Licensing
 
@@ -116,7 +122,7 @@ notice beside the `ffmpeg` it bundles.
 ## Building locally
 
 ```sh
-# Linux or macOS: needs a C compiler, make, nasm (on x86_64), pkg-config, curl; rustc for the test streams.
+# Linux or macOS: needs a C compiler, make, nasm (on x86_64), pkg-config, curl; rustc for the test inputs.
 export PREFIX="$PWD/prefix" OUTPUT="$PWD/out/ffmpeg"
 scripts/fetch-sources.sh sources
 scripts/build-x264.sh

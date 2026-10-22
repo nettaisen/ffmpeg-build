@@ -9,8 +9,8 @@
 #
 # Run by hand (Actions -> build-ffmpeg -> Run workflow). Each binary has only
 # what nettai's replay export runs (scripts/ffmpeg-config-common.sh), and is
-# smoke-tested with nettai's exact command on streams nettai's NUT writer
-# made; a last job decodes every platform's MP4s with a full ffmpeg. Then a
+# smoke-tested with nettai's exact commands on the raw bytes nettai writes; a
+# last job decodes every platform's MP4s with a full ffmpeg. Then a
 # GitHub Release tagged ffmpeg-<version>-<revision> is published with the
 # binaries, a .sha256 each, the source tarballs they were built from, this
 # repository's scripts, and the license texts (the binaries are GPL).
@@ -40,8 +40,8 @@ env:
 
 jobs:
   # The sources every platform builds from, fetched once (so each builds the
-  # same bytes, and the release carries exactly those), and the NUT streams
-  # the smoke tests feed it.
+  # same bytes, and the release carries exactly those), and the raw inputs the
+  # smoke tests feed it.
   prepare:
     runs-on: ubuntu-24.04
     outputs:
@@ -64,7 +64,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Fetch the sources
         run: scripts/fetch-sources.sh sources
-      - name: Make the smoke test's streams (nettai's NUT writer)
+      - name: Make the smoke test's inputs (the raw bytes nettai writes)
         run: scripts/make-streams.sh streams
       - uses: actions/upload-artifact@v7
         with:
