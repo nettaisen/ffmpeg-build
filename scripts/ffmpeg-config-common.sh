@@ -3,15 +3,15 @@
 # from and every component it has.
 #
 # nettai links no FFmpeg library. Its replay export (crates/nettai-video's
-# ffmpeg module, run by the app's crates/nettai/src/screens/replays/export.rs
+# desktop platform, run by the app's crates/nettai/src/screens/replays/export.rs
 # and by nettai-tool --mp4) runs an `ffmpeg` child a track: one for the
-# picture, written the replay's raw RGB frames on its standard input, and one
-# for each sound track, written its raw samples on its own. Each writes a
-# fragmented MP4 of its track on its standard output, which nettai reads back
-# and puts together into the MP4 itself. The ffmpeg built here has what those
-# two commands need and nothing more: configure starts from
-# --disable-everything and each component is enabled again below, with the
-# part of nettai's commands it serves.
+# picture, written the replay's frames as raw NV12 on its standard input, and
+# one for each sound track, written its raw samples on its own. Each writes its
+# track's codec data on its standard output (the picture's H.264 as an Annex B
+# stream, a sound track's AAC as ADTS), of which nettai makes the MP4 itself.
+# The ffmpeg built here has what those two commands need and nothing more:
+# configure starts from --disable-everything and each component is enabled
+# again below, with the part of nettai's commands it serves.
 
 # ---------------------------------------------------------------------------
 # Versions
@@ -27,27 +27,27 @@
 export FFMPEG_VERSION X264_COMMIT
 
 # ---------------------------------------------------------------------------
-# What nettai runs (crates/nettai-video/src/ffmpeg.rs: picture_arguments and
-# sound_arguments)
+# What nettai runs (crates/nettai-video/src/platform/desktop.rs:
+# picture_arguments and sound_arguments)
 #
 #   ffmpeg -hide_banner -nostdin -loglevel error
-#          -f rawvideo -pixel_format rgb24 -video_size WxH -framerate 262144/4389 -i pipe:0
-#          -vf scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int+area,format=yuv420p,setparams=color_primaries=bt709:color_trc=bt709
-#          -c:v libx264 -preset medium -tune animation -crf 16 -g 120
-#          -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv
-#          -f mp4 -movflags +frag_keyframe+empty_moov+delay_moov+default_base_moof -frag_duration 2000000 pipe:1
+#          -f rawvideo -pixel_format nv12 -video_size WxH -framerate 262144/4389 -i pipe:0
+#          -c:v libx264 -preset medium -tune animation -crf 16 -g 120 -bf 0
+#          -x264-params aud=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv
+#          -f h264 pipe:1
 #
 #   ffmpeg -hide_banner -nostdin -loglevel error
 #          -f f32le -sample_rate 48000 -ch_layout stereo -i pipe:0
-#          -c:a aac -b:a 192k
-#          -f mp4 -movflags +empty_moov+delay_moov+default_base_moof -frag_duration 2000000 pipe:1
+#          -c:a aac -b:a 192000
+#          -f adts pipe:1
 #
-# with format=yuv444p in place of yuv420p for Chroma::Full, and other CRFs
-# and audio bit rates by its settings (options of the same encoders). The
-# picture is 8-bit RGB, square pixels, at the GBA frame's exact rate
-# (262144/4389 a second); the sound is 32-bit float little-endian stereo at
-# 48 kHz, which nettai resamples to itself (from the GBA's 32768 Hz). nettai
-# asks ffmpeg nothing else: no -version, no probing.
+# The picture is NV12 (BT.709's matrix, the video range: nettai converts the
+# game's RGB itself, the same bytes every platform's encoder is given), at the
+# GBA frame's exact rate (262144/4389 a second); the sound is 32-bit float
+# little-endian stereo at 48 kHz, which nettai resamples to itself (from the
+# GBA's 32768 Hz). No B-frames: nettai times each picture by its place. The
+# color is tagged in the H.264 stream itself (x264's VUI), which nettai's MP4
+# carries. nettai asks ffmpeg nothing else: no -version, no probing.
 #
 # Why each component is here:
 #
@@ -55,43 +55,34 @@ export FFMPEG_VERSION X264_COMMIT
 #     rawvideo       "-f rawvideo -i pipe:0": the picture's frames
 #     pcm_f32le      "-f f32le -i pipe:0": a sound track's samples
 #   Decoders
-#     rawvideo       the frames' RGB
+#     rawvideo       the frames' NV12
 #     pcm_f32le      the samples' floats
 #   Protocol
 #     pipe           "-i pipe:0" and "pipe:1": nettai writes the file itself
 #   Filters
-#     scale          "scale=out_color_matrix=bt709:out_range=tv:flags=...":
-#                    RGB to BT.709 limited-range YUV (swscale)
-#     format         "format=yuv420p" (or yuv444p)
-#     setparams      "setparams=color_primaries=bt709:color_trc=bt709": the
-#                    primaries and transfer tagged on the frames (FFmpeg
-#                    9.0's encoder takes them from the frames, which raw
-#                    RGB gives none, and with -color_primaries and
-#                    -color_trc alone the MP4 says "unknown")
 #     aresample      the float samples made the planar floats AAC takes,
 #                    inserted by ffmpeg (swresample; nothing is resampled)
 #     aformat        the formats AAC takes, inserted by ffmpeg
 #     null, anull    the pass-through ends ffmpeg puts in a stream's graph
-#                    where it has no filter of its own (the sound's)
+#                    where it has no filter of its own
 #   Encoders
 #     libx264        "-c:v libx264 -preset medium -tune animation -crf 16"
-#     aac            "-c:a aac -b:a 192k"
-#   Muxer
-#     mp4            "-f mp4 -movflags +...": a fragmented MP4 on the pipe
-#                    (libavformat's movenc)
+#                    (it takes NV12 as it is: no scaling, no conversion)
+#     aac            "-c:a aac -b:a 192000"
+#   Muxers
+#     h264           "-f h264": the picture's Annex B stream on the pipe
+#     adts           "-f adts": a sound track's AAC frames on the pipe
 #   External library
 #     libx264 (--enable-gpl)   the H.264 encoder; it makes the binary GPL
 #
 # Configure adds what these need on its own, and nothing here asks for it:
 # the ffmpeg program brings its filter graph's ends (buffer, buffersink,
 # abuffer, abuffersink) and the filters its own options use (atrim, crop,
-# hflip, rotate, transpose, trim, vflip: configure's ffmpeg_select); the mp4
-# muxer brings the mov muxer (the same code), the aac_adtstoasc and
-# vp9_superframe bitstream filters and the ac3 parser (mov_muxer_select).
-# No extract_extradata bitstream filter: libx264 gives the H.264 track's
-# parameter sets itself (the smoke test's MP4s decode without it). Nothing
-# else is built: no other codec, container, protocol, device, network, or
-# hardware API.
+# hflip, rotate, transpose, trim, vflip: configure's ffmpeg_select); the adts
+# muxer brings the mpeg4audio code (adts_muxer_select). No bitstream filter:
+# libx264 writes Annex B itself, which the h264 muxer passes on. Nothing else
+# is built: no other codec, container, protocol, device, network, or hardware
+# API.
 # ---------------------------------------------------------------------------
 
 ffmpeg_component_flags() {
@@ -102,9 +93,9 @@ ffmpeg_component_flags() {
 --enable-demuxer=rawvideo,pcm_f32le
 --enable-decoder=rawvideo,pcm_f32le
 --enable-protocol=pipe
---enable-filter=scale,format,setparams,aresample,aformat,null,anull
+--enable-filter=aresample,aformat,null,anull
 --enable-encoder=libx264,aac
---enable-muxer=mp4
+--enable-muxer=h264,adts
 FLAGS
 }
 

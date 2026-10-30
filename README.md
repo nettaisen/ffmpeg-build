@@ -3,10 +3,11 @@
 Builds of a **minimal static `ffmpeg`** for [nettai](https://github.com/bigfarts/nettai), which bundles it in
 every package so a replay can be exported as video with nothing else installed.
 
-nettai links no FFmpeg library. Its replay export (`crates/nettai-video`'s `ffmpeg` module, run by the app and by
-`nettai-tool --mp4`) runs an `ffmpeg` child a track: one for the picture, written the replay's raw RGB frames on
-its standard input, and one for each sound track, written its raw samples. Each writes a fragmented MP4 of its
-track on its standard output, which nettai reads back and puts together into the MP4 itself. This repository
+nettai links no FFmpeg library. Its replay export (`crates/nettai-video`'s desktop platform, run by the app and by
+`nettai-tool --mp4`) runs an `ffmpeg` child a track: one for the picture, written the replay's frames as raw NV12
+on its standard input, and one for each sound track, written its raw samples. Each writes its track's codec data
+on its standard output (the picture's H.264 as an Annex B stream, a sound track's AAC as ADTS), of which nettai
+makes the MP4 itself. This repository
 builds that program for every platform nettai's release packages, with what those two commands need and nothing
 more: configure starts from `--disable-everything` and each component is enabled again, traced to nettai's
 commands. The user's request: "it should support whatever
@@ -42,26 +43,26 @@ pins a release by its tag and each file it takes by its SHA-256 (`packaging/ffmp
 
 ## What's enabled, and why
 
-nettai's commands (`crates/nettai-video/src/ffmpeg.rs`, `picture_arguments` and `sound_arguments`):
+nettai's commands (`crates/nettai-video/src/platform/desktop.rs`, `picture_arguments` and `sound_arguments`):
 
 ```text
 ffmpeg -hide_banner -nostdin -loglevel error
-       -f rawvideo -pixel_format rgb24 -video_size WxH -framerate 262144/4389 -i pipe:0
-       -vf scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int+area,format=yuv420p,setparams=color_primaries=bt709:color_trc=bt709
-       -c:v libx264 -preset medium -tune animation -crf 16 -g 120
-       -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv
-       -f mp4 -movflags +frag_keyframe+empty_moov+delay_moov+default_base_moof -frag_duration 2000000 pipe:1
+       -f rawvideo -pixel_format nv12 -video_size WxH -framerate 262144/4389 -i pipe:0
+       -c:v libx264 -preset medium -tune animation -crf 16 -g 120 -bf 0
+       -x264-params aud=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv
+       -f h264 pipe:1
 
 ffmpeg -hide_banner -nostdin -loglevel error
        -f f32le -sample_rate 48000 -ch_layout stereo -i pipe:0
-       -c:a aac -b:a 192k
-       -f mp4 -movflags +empty_moov+delay_moov+default_base_moof -frag_duration 2000000 pipe:1
+       -c:a aac -b:a 192000
+       -f adts pipe:1
 ```
 
-with `format=yuv444p` for `Chroma::Full`, and other CRFs and audio bit rates by its settings. The picture is
-8-bit RGB at the GBA frame's exact rate (262144/4389 a second); the sound is 32-bit float stereo at 48 kHz, which
-nettai resamples to itself (from the GBA's 32768 Hz). nettai asks ffmpeg nothing else (no `-version`, no
-probing).
+The picture is NV12 (BT.709's matrix, the video range: nettai converts the game's RGB itself, the same bytes
+every platform's encoder is given) at the GBA frame's exact rate (262144/4389 a second), with no B-frames (nettai
+times each picture by its place) and its color tagged in the stream itself; the sound is 32-bit float stereo at
+48 kHz, which nettai resamples to itself (from the GBA's 32768 Hz). nettai asks ffmpeg nothing else (no
+`-version`, no probing).
 
 The one place the components are named is [`scripts/ffmpeg-config-common.sh`](scripts/ffmpeg-config-common.sh):
 
@@ -69,40 +70,37 @@ The one place the components are named is [`scripts/ffmpeg-config-common.sh`](sc
 | ------------------------------------ | ------------------------------------------------------------------------------ |
 | demuxer `rawvideo`                   | `-f rawvideo -i pipe:0`: the picture's frames                                  |
 | demuxer `pcm_f32le`                  | `-f f32le -i pipe:0`: a sound track's samples                                  |
-| decoder `rawvideo`                   | the frames' RGB                                                                |
+| decoder `rawvideo`                   | the frames' NV12                                                               |
 | decoder `pcm_f32le`                  | the samples' floats                                                            |
 | protocol `pipe`                      | `-i pipe:0` and `pipe:1`: nettai writes the file itself                        |
-| filter `scale` (swscale)             | `scale=out_color_matrix=bt709:out_range=tv:flags=…`: RGB to BT.709 TV-range YUV |
-| filter `format`                      | `format=yuv420p` (or `yuv444p`)                                                |
-| filter `setparams`                   | `setparams=color_primaries=bt709:color_trc=bt709`: FFmpeg 9.0's encoder takes the primaries and transfer from the frames, and with `-color_primaries`/`-color_trc` alone the MP4 says "unknown" |
 | filter `aresample` (swresample)      | the float samples made the planar floats AAC takes, inserted by ffmpeg (nothing is resampled) |
 | filter `aformat`                     | the formats AAC takes, inserted by ffmpeg                                      |
 | filters `null`, `anull`              | the pass-through ends of a stream's graph where it has no filter of its own   |
-| encoder `libx264`                    | `-c:v libx264 -preset medium -tune animation -crf 16`                          |
-| encoder `aac`                        | `-c:a aac -b:a 192k`                                                           |
-| muxer `mp4` (movenc)                 | `-f mp4 -movflags +…`: a fragmented MP4 on the pipe                            |
+| encoder `libx264`                    | `-c:v libx264 -preset medium -tune animation -crf 16 -bf 0`, NV12 as it is     |
+| encoder `aac`                        | `-c:a aac -b:a 192000`                                                         |
+| muxer `h264`                         | `-f h264`: the picture's Annex B stream on the pipe                            |
+| muxer `adts`                         | `-f adts`: a sound track's AAC frames on the pipe                              |
 | external library `libx264` (`--enable-gpl`) | the H.264 encoder; it makes the binary GPL                              |
 
 Configure adds what these need by itself: the `ffmpeg` program brings its filter graph's ends and the filters
-its own options use (`atrim`, `crop`, `hflip`, `rotate`, `transpose`, `trim`, `vflip`), and the `mp4` muxer
-brings `mov` (the same code), the `aac_adtstoasc` and `vp9_superframe` bitstream filters and the `ac3` parser.
-There is no `extract_extradata` bitstream filter: libx264 gives the H.264 track's parameter sets itself, and the
-MP4s decode without it. Nothing else is built: no other codec, container, protocol, device, network, or
-hardware API; no `ffprobe` or `ffplay`. x264 is built 8-bit only, with every chroma format (4:4:4 is
-`Chroma::Full`).
+its own options use (`atrim`, `crop`, `hflip`, `rotate`, `transpose`, `trim`, `vflip`), and the `adts` muxer the
+`mpeg4audio` code. No bitstream filter: libx264 writes Annex B itself, which the `h264` muxer passes on. Nothing
+else is built: no other codec, container, protocol, device, network, or hardware API; no `ffprobe` or
+`ffplay`. x264 is built 8-bit only (nettai gives it 4:2:0).
 
 ## Tests
 
 Each platform's binary is **smoke-tested** ([`scripts/smoke-test.sh`](scripts/smoke-test.sh)) with nettai's
 exact commands on the raw bytes nettai writes, made by [`smoke/make_streams.rs`](smoke/make_streams.rs)
-([`scripts/make-streams.sh`](scripts/make-streams.sh)): two seconds of frames at twice the frame, encoded in
-4:2:0 and in 4:4:4, a second at three times the frame, and their sound at two bit rates. ffmpeg must end well,
-say nothing at `-loglevel error`, and write a fragmented MP4 whose index comes before its first fragment. Then
-[`scripts/verify-mp4s.sh`](scripts/verify-mp4s.sh) decodes every platform's MP4s with the runner's full ffmpeg
-and checks them: H.264 of every frame at the input's size and frame rate, the pixel format asked for, tagged
-BT.709 TV range, the picture close to the input's (PSNR against the input put through the same conversion);
-AAC at 48 kHz stereo, as many samples as it was given once its edit list leaves the encoder's delay out, not
-silence; every packet decoding without an error. A release is published only when all of it passes.
+([`scripts/make-streams.sh`](scripts/make-streams.sh)): two seconds of NV12 frames at twice the frame (made of
+RGB as nettai makes them), a second at three times the frame, and their sound. ffmpeg must end well, say nothing
+at `-loglevel error`, and write an H.264 stream that starts with an access unit delimiter, and ADTS that starts
+with its sync word. Then [`scripts/verify-outputs.sh`](scripts/verify-outputs.sh) decodes every platform's
+outputs with the runner's full ffmpeg and checks them: H.264 High of every frame at the input's size, no
+B-frames, 4:2:0, tagged BT.709 TV range, the picture close to the NV12 given (PSNR 45 dB at least); AAC LC at
+48 kHz stereo, decoding to the encoder's delay of 1024 samples, the samples given and less than a frame of
+padding, not silence; every packet decoding without an error. A release is published only when all of it
+passes.
 
 ## Versions
 
@@ -128,8 +126,8 @@ scripts/fetch-sources.sh sources
 scripts/build-x264.sh
 scripts/build-ffmpeg.sh
 scripts/make-streams.sh streams
-scripts/smoke-test.sh out/ffmpeg streams mp4s
-scripts/verify-mp4s.sh streams mp4s        # with a full ffmpeg and ffprobe on PATH
+scripts/smoke-test.sh out/ffmpeg streams outputs
+scripts/verify-outputs.sh streams outputs  # with a full ffmpeg and ffprobe on PATH
 ```
 
 On macOS, set `MACOSX_DEPLOYMENT_TARGET=11.0` and `EXTRA_CFLAGS`/`EXTRA_LDFLAGS` to

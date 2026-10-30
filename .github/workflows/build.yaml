@@ -10,7 +10,7 @@
 # Run by hand (Actions -> build-ffmpeg -> Run workflow). Each binary has only
 # what nettai's replay export runs (scripts/ffmpeg-config-common.sh), and is
 # smoke-tested with nettai's exact commands on the raw bytes nettai writes; a
-# last job decodes every platform's MP4s with a full ffmpeg. Then a
+# last job decodes every platform's outputs with a full ffmpeg. Then a
 # GitHub Release tagged ffmpeg-<version>-<revision> is published with the
 # binaries, a .sha256 each, the source tarballs they were built from, this
 # repository's scripts, and the license texts (the binaries are GPL).
@@ -106,7 +106,7 @@ jobs:
           scripts/build-x264.sh
           scripts/build-ffmpeg.sh
       - name: Smoke test
-        run: scripts/smoke-test.sh out/ffmpeg-linux-x86_64 streams mp4s
+        run: scripts/smoke-test.sh out/ffmpeg-linux-x86_64 streams outputs
       - name: Dependencies, size and checksum
         run: |
           file out/ffmpeg-linux-x86_64
@@ -120,8 +120,8 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
-          name: mp4s-linux-x86_64
-          path: mp4s
+          name: outputs-linux-x86_64
+          path: outputs
           if-no-files-found: error
 
   # FFmpeg's "Compiling FFmpeg with MSVC": MSYS2 gives bash, make and nasm;
@@ -172,7 +172,7 @@ jobs:
           scripts/build-ffmpeg.sh
       - name: Smoke test
         shell: msys2 {0}
-        run: scripts/smoke-test.sh out/ffmpeg-windows-x86_64.exe streams mp4s
+        run: scripts/smoke-test.sh out/ffmpeg-windows-x86_64.exe streams outputs
       - name: Dependencies, size and checksum
         shell: msys2 {0}
         run: |
@@ -186,8 +186,8 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
-          name: mp4s-windows-x86_64
-          path: mp4s
+          name: outputs-windows-x86_64
+          path: outputs
           if-no-files-found: error
 
   macos:
@@ -233,7 +233,7 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: arch -x86_64 /usr/bin/true || softwareupdate --install-rosetta --agree-to-license
       - name: Smoke test
-        run: scripts/smoke-test.sh "out/ffmpeg-macos-${{ matrix.arch }}" streams mp4s
+        run: scripts/smoke-test.sh "out/ffmpeg-macos-${{ matrix.arch }}" streams outputs
       - name: Architecture, dependencies, size and checksum
         run: |
           file "out/ffmpeg-macos-${{ matrix.arch }}"
@@ -248,11 +248,11 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
-          name: mp4s-macos-${{ matrix.arch }}
-          path: mp4s
+          name: outputs-macos-${{ matrix.arch }}
+          path: outputs
           if-no-files-found: error
 
-  # Every platform's MP4s, decoded by a full ffmpeg (the minimal one decodes
+  # Every platform's outputs, decoded by a full ffmpeg (the minimal one decodes
   # no H.264 or AAC).
   verify:
     needs: [linux-x86_64, windows-x86_64, macos]
@@ -265,14 +265,14 @@ jobs:
           path: streams
       - uses: actions/download-artifact@v8
         with:
-          pattern: mp4s-*
-          path: mp4s
+          pattern: outputs-*
+          path: outputs
       - name: A full ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends ffmpeg
-      - name: Decode and check every MP4
-        run: scripts/verify-mp4s.sh streams mp4s/*
+      - name: Decode and check every output
+        run: scripts/verify-outputs.sh streams outputs/*
 
   release:
     needs: [prepare, verify]
