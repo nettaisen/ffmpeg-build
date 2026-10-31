@@ -15,6 +15,8 @@
 #                 takes no -L, and finds x264 through pkg-config)
 #   FFMPEG_EXTRA  more configure flags, split at spaces (cross-compiling, the
 #                 toolchain)
+#   RUN_BUILT     "no" when this machine can't run the program built (made for
+#                 another system): it isn't asked its version here
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,4 +64,6 @@ mkdir -p "$(dirname "$OUTPUT")"
 cp "ffmpeg${EXE_SUFFIX:-}" "$OUTPUT"
 strip "$OUTPUT" >/dev/null 2>&1 || true
 echo "=== built $OUTPUT ==="
-"$OUTPUT" -hide_banner -version
+if [ "${RUN_BUILT:-yes}" != no ]; then
+  "$OUTPUT" -hide_banner -version
+fi

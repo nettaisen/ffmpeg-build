@@ -15,7 +15,7 @@ source "$HERE/ffmpeg-config-common.sh"
 
 [ $# -eq 3 ] || { echo "usage: $0 SOURCES_DIR TAG SCRIPTS_TARBALL" >&2; exit 2; }
 SOURCES="$1" TAG="$2" SCRIPTS="$3"
-: "${GITHUB_REPOSITORY:=bigfarts/nettai-ffmpeg-build}"
+: "${GITHUB_REPOSITORY:=nettaisen/ffmpeg-build}"
 releases="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
 ffmpeg="ffmpeg-${FFMPEG_VERSION}.tar.xz"
 x264="x264-${X264_COMMIT}.tar.bz2"

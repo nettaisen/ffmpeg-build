@@ -1,6 +1,6 @@
 # nettai-ffmpeg-build
 
-Builds of a **minimal static `ffmpeg`** for [nettai](https://github.com/bigfarts/nettai), which bundles it in
+Builds of a **minimal static `ffmpeg`** for [nettai](https://github.com/nettaisen/nettai), which bundles it in
 every package so a replay can be exported as video with nothing else installed.
 
 nettai links no FFmpeg library. Its replay export (`crates/nettai-video`'s desktop platform, run by the app and by
@@ -18,13 +18,18 @@ to build ffmpeg every time".
 
 The [`build-ffmpeg`](.github/workflows/build.yaml) workflow is run by hand (Actions → build-ffmpeg → Run
 workflow) with an FFmpeg release (`ffmpeg_version`, 9.0.2 by default) and a revision (`revision`, 1 by
-default; a new one for each rebuild of the same version). It publishes a GitHub Release tagged
-`ffmpeg-<version>-<revision>` and refuses a tag that is released already. Each release carries:
+default; a new one for each rebuild of the same version). On main, with `publish` on (the default), it
+publishes a GitHub Release tagged `ffmpeg-<version>-<revision>` and refuses a tag that is released already.
+With `publish` off it builds and tests everything and keeps the binaries (with their `.sha256`s) as the run's
+artifacts, and releases nothing: how a change is tried on a branch, and how nettai's packaging is tried with
+binaries not yet released (its `NETTAI_BUNDLE_FFMPEG`). Each release carries:
 
 | Asset                                   | What                                                                       |
 | --------------------------------------- | -------------------------------------------------------------------------- |
 | `ffmpeg-linux-x86_64`                   | Linux x86_64, built on ubuntu-22.04, fully static (runs on any distro)     |
+| `ffmpeg-linux-arm64`                    | Linux arm64, built on ubuntu-22.04-arm, fully static                       |
 | `ffmpeg-windows-x86_64.exe`             | Windows x86_64, MSVC with the static CRT: needs no DLL beyond Windows' own |
+| `ffmpeg-windows-arm64.exe`              | Windows on Arm, cross-compiled with llvm-mingw against the UCRT, static: needs no DLL beyond Windows' own; tested on windows-11-arm |
 | `ffmpeg-macos-arm64`                    | macOS arm64, for macOS 11 and later                                        |
 | `ffmpeg-macos-x86_64`                   | macOS x86_64, cross-compiled on the arm64 runner, tested under Rosetta     |
 | `*.sha256`                              | each binary's (and the notice's) SHA-256                                   |
@@ -36,6 +41,13 @@ default; a new one for each rebuild of the same version). It publishes a GitHub 
 
 The two macOS slices are released apart; nettai's macOS packaging joins them into one universal binary with
 `lipo` (and an arm64-only local package takes the arm64 slice alone).
+
+Windows on Arm's is cross-compiled on Linux with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (a pinned
+release, checked by its SHA-256): Clang and LLD for `aarch64-w64-mingw32`, which assemble x264's and FFmpeg's NEON
+code as they are. The program links against the UCRT (`api-ms-win-crt-*`, Windows' own since Windows 10, so on
+every Windows that runs on Arm) and has everything else linked in (`-static`); the job fails if it imports a DLL
+that isn't Windows' own. MSVC's way, as x86_64 is built, would need MSYS2 for configure and make, which the
+`windows-11-arm` runner doesn't have. The program built is then smoke-tested natively on `windows-11-arm`.
 
 Download URLs are stable, e.g.
 `https://github.com/nettaisen/ffmpeg-build/releases/download/ffmpeg-9.0.2-2/ffmpeg-linux-x86_64`. nettai
@@ -90,7 +102,8 @@ else is built: no other codec, container, protocol, device, network, or hardware
 
 ## Tests
 
-Each platform's binary is **smoke-tested** ([`scripts/smoke-test.sh`](scripts/smoke-test.sh)) with nettai's
+Each platform's binary is **smoke-tested** ([`scripts/smoke-test.sh`](scripts/smoke-test.sh)), on that
+platform (Windows on Arm's in a job of its own on `windows-11-arm`, after it is built on Linux), with nettai's
 exact commands on the raw bytes nettai writes, made by [`smoke/make_streams.rs`](smoke/make_streams.rs)
 ([`scripts/make-streams.sh`](scripts/make-streams.sh)): two seconds of NV12 frames at twice the frame (made of
 RGB as nettai makes them), a second at three times the frame, and their sound. ffmpeg must end well, say nothing
@@ -132,5 +145,16 @@ scripts/verify-outputs.sh streams outputs  # with a full ffmpeg and ffprobe on P
 
 On macOS, set `MACOSX_DEPLOYMENT_TARGET=11.0` and `EXTRA_CFLAGS`/`EXTRA_LDFLAGS` to
 `-mmacosx-version-min=11.0`, as the workflow does.
+
+Windows on Arm's, on Linux or macOS with llvm-mingw's `bin` on PATH (the program runs on Windows on Arm alone, so
+the build doesn't run it: `RUN_BUILT=no`; smoke-test it there):
+
+```sh
+export PREFIX="$PWD/prefix" OUTPUT="$PWD/out/ffmpeg-windows-arm64.exe" EXE_SUFFIX=.exe RUN_BUILT=no
+export X264_HOST=aarch64-w64-mingw32 X264_CROSS_PREFIX=aarch64-w64-mingw32- EXTRA_LDFLAGS=-static
+export FFMPEG_EXTRA="--enable-cross-compile --arch=aarch64 --target-os=mingw32 --cross-prefix=aarch64-w64-mingw32- --pkg-config=pkg-config"
+scripts/build-x264.sh
+scripts/build-ffmpeg.sh
+```
 
 This repository's build scripts started as [tangobattle/ffmpeg-build](https://github.com/tangobattle/ffmpeg-build)'s.

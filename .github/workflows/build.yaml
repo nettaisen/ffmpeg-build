@@ -1,7 +1,12 @@
 # Builds the minimal static ffmpeg nettai bundles, for every platform nettai's
 # release packages:
 #   - Linux x86_64    built on ubuntu-22.04, linked fully statically
+#   - Linux arm64     the same, natively on ubuntu-22.04-arm
 #   - Windows x86_64  MSVC, static CRT: needs no DLL beyond Windows' own
+#   - Windows arm64   cross-compiled on Linux with llvm-mingw (Clang and LLD
+#                     for Windows on Arm, against the UCRT every Windows on
+#                     Arm has), linked statically: needs no DLL beyond
+#                     Windows' own; smoke-tested natively on windows-11-arm
 #   - macOS arm64     native, for macOS 11 and later
 #   - macOS x86_64    cross-compiled on the same arm64 runner, smoke-tested
 #                     under Rosetta. The two slices are released apart;
@@ -10,10 +15,13 @@
 # Run by hand (Actions -> build-ffmpeg -> Run workflow). Each binary has only
 # what nettai's replay export runs (scripts/ffmpeg-config-common.sh), and is
 # smoke-tested with nettai's exact commands on the raw bytes nettai writes; a
-# last job decodes every platform's outputs with a full ffmpeg. Then a
-# GitHub Release tagged ffmpeg-<version>-<revision> is published with the
-# binaries, a .sha256 each, the source tarballs they were built from, this
-# repository's scripts, and the license texts (the binaries are GPL).
+# last job decodes every platform's outputs with a full ffmpeg. Then, with
+# `publish` on (the default) and on main, a GitHub Release tagged
+# ffmpeg-<version>-<revision> is published with the binaries, a .sha256 each,
+# the source tarballs they were built from, this repository's scripts, and the
+# license texts (the binaries are GPL). With `publish` off, the run builds and
+# tests everything and keeps the binaries as its artifacts alone: nothing is
+# released, and the revision may be one released already.
 name: build-ffmpeg
 
 on:
@@ -27,6 +35,10 @@ on:
         description: "The build's number for that version: the release is ffmpeg-<version>-<revision>"
         required: true
         default: "1"
+      publish:
+        description: "Publish the release ffmpeg-<version>-<revision> (on main); off, the binaries are the run's artifacts alone"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -53,11 +65,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REVISION: ${{ inputs.revision }}
+          PUBLISH: ${{ inputs.publish }}
         run: |
           [[ "$FFMPEG_VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "not a release version: $FFMPEG_VERSION" >&2; exit 1; }
           [[ "$REVISION" =~ ^[1-9][0-9]*$ ]] || { echo "not a revision: $REVISION" >&2; exit 1; }
           tag="ffmpeg-$FFMPEG_VERSION-$REVISION"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # (A run that publishes nothing may build a revision released already.)
+          if [ "$PUBLISH" = true ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "$tag is released already: give another revision" >&2
             exit 1
           fi
@@ -77,9 +91,28 @@ jobs:
           path: streams
           if-no-files-found: error
 
-  linux-x86_64:
+  # Linux, natively on each architecture's runner. (-static: one file that
+  # runs on any Linux of its architecture, whatever its C library; with no
+  # network and no devices nothing needs glibc's dynamic parts.)
+  linux:
     needs: prepare
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            machine: x86-64
+            # (nasm: x264's and FFmpeg's x86 assembly.)
+            tools: build-essential nasm pkg-config
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            machine: ARM aarch64
+            # (Their NEON assembly is the compiler's to assemble.)
+            tools: build-essential pkg-config
+    env:
+      NAME: ffmpeg-linux-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -93,34 +126,32 @@ jobs:
       - name: Build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends build-essential nasm pkg-config
-      # (-static: one file that runs on any x86_64 Linux, whatever its C
-      # library; with no network and no devices nothing needs glibc's dynamic
-      # parts.)
-      - name: Build x264 and ffmpeg
+          sudo apt-get install --yes --no-install-recommends ${{ matrix.tools }}
+      - name: Build x264 and ffmpeg (${{ matrix.arch }})
         env:
           PREFIX: ${{ github.workspace }}/prefix
-          OUTPUT: ${{ github.workspace }}/out/ffmpeg-linux-x86_64
+          OUTPUT: ${{ github.workspace }}/out/ffmpeg-linux-${{ matrix.arch }}
           EXTRA_LDFLAGS: -static
         run: |
           scripts/build-x264.sh
           scripts/build-ffmpeg.sh
       - name: Smoke test
-        run: scripts/smoke-test.sh out/ffmpeg-linux-x86_64 streams outputs
-      - name: Dependencies, size and checksum
+        run: scripts/smoke-test.sh "out/$NAME" streams outputs
+      - name: Architecture, dependencies, size and checksum
         run: |
-          file out/ffmpeg-linux-x86_64
-          ldd out/ffmpeg-linux-x86_64 || true
-          ls -l out/ffmpeg-linux-x86_64
-          (cd out && sha256sum ffmpeg-linux-x86_64 > ffmpeg-linux-x86_64.sha256)
+          file "out/$NAME"
+          file "out/$NAME" | grep -q "${{ matrix.machine }}, .*statically linked"
+          ldd "out/$NAME" || true
+          ls -l "out/$NAME"
+          (cd out && sha256sum "$NAME" > "$NAME.sha256")
       - uses: actions/upload-artifact@v7
         with:
-          name: ffmpeg-linux-x86_64
-          path: out/ffmpeg-linux-x86_64*
+          name: ffmpeg-linux-${{ matrix.arch }}
+          path: out/ffmpeg-linux-${{ matrix.arch }}*
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
-          name: outputs-linux-x86_64
+          name: outputs-linux-${{ matrix.arch }}
           path: outputs
           if-no-files-found: error
 
@@ -190,6 +221,105 @@ jobs:
           path: outputs
           if-no-files-found: error
 
+  # Windows on Arm, cross-compiled on Linux with llvm-mingw: Clang, LLD and
+  # mingw-w64 for aarch64 Windows (its aarch64-w64-mingw32-gcc is Clang), the
+  # program linked against the UCRT, which is Windows' own on every Windows
+  # that runs on Arm, and everything else linked in (-static: libc++,
+  # libunwind, winpthreads). The windows-11-arm image has no MSYS2 for
+  # FFmpeg's configure and make, which MSVC's way would need; llvm-mingw is how
+  # FFmpeg's Windows on Arm builds are commonly made. x264's and FFmpeg's NEON
+  # assembly is Clang's to assemble. The program is tested where it runs, in
+  # the next job.
+  windows-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    env:
+      NAME: ffmpeg-windows-arm64.exe
+      # https://github.com/mstorsjo/llvm-mingw/releases/tag/20261020 (LLVM 23.1.4)
+      LLVM_MINGW: llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64
+      LLVM_MINGW_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz
+      LLVM_MINGW_SHA256: 55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: sources
+          path: sources
+      - name: Build tools (llvm-mingw, pkg-config)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/llvm-mingw.tar.xz" "$LLVM_MINGW_URL"
+          echo "$LLVM_MINGW_SHA256  $RUNNER_TEMP/llvm-mingw.tar.xz" | sha256sum -c
+          tar -xJf "$RUNNER_TEMP/llvm-mingw.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends pkg-config
+      # (pkg-config is the build machine's, which finds x264 in $PREFIX: the
+      # cross prefix would make it aarch64-w64-mingw32-pkg-config. The program
+      # can't run here, so it isn't asked its version.)
+      - name: Build x264 and ffmpeg
+        env:
+          PREFIX: ${{ github.workspace }}/prefix
+          OUTPUT: ${{ github.workspace }}/out/ffmpeg-windows-arm64.exe
+          EXE_SUFFIX: .exe
+          X264_HOST: aarch64-w64-mingw32
+          X264_CROSS_PREFIX: aarch64-w64-mingw32-
+          EXTRA_LDFLAGS: -static
+          FFMPEG_EXTRA: --enable-cross-compile --arch=aarch64 --target-os=mingw32 --cross-prefix=aarch64-w64-mingw32- --pkg-config=pkg-config
+          RUN_BUILT: "no"
+        run: |
+          scripts/build-x264.sh
+          scripts/build-ffmpeg.sh
+      # Windows' own DLLs alone: the UCRT's api-ms-win-crt-* (Windows' since
+      # 10), KERNEL32, and the few others FFmpeg calls (bcrypt for its random
+      # seed, SHELL32 for the command line's words); nothing of the
+      # toolchain's.
+      - name: Architecture, dependencies, size and checksum
+        run: |
+          file "out/$NAME"
+          file "out/$NAME" | grep -q "PE32+ executable (console) Aarch64"
+          dlls=$(llvm-readobj --coff-imports "out/$NAME" | sed -n 's/^ *Name: //p' | sort -u)
+          echo "$dlls"
+          others=$(echo "$dlls" | grep -viE '^(api-ms-win-crt-[a-z]+-l1-1-0|kernel32|bcrypt|shell32|advapi32|user32|ole32)\.dll$' || true)
+          [ -z "$others" ] || { echo "needs DLLs that aren't Windows' own: $others" >&2; exit 1; }
+          ls -l "out/$NAME"
+          (cd out && sha256sum "$NAME" > "$NAME.sha256")
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-windows-arm64
+          path: out/ffmpeg-windows-arm64.exe*
+          if-no-files-found: error
+
+  # The Windows on Arm program, smoke-tested where it runs (Git's bash runs the
+  # script).
+  windows-arm64-test:
+    needs: windows-arm64
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: streams
+          path: streams
+      - uses: actions/download-artifact@v8
+        with:
+          name: ffmpeg-windows-arm64
+          path: out
+      - name: Smoke test
+        shell: bash
+        run: |
+          (cd out && sha256sum -c ffmpeg-windows-arm64.exe.sha256)
+          scripts/smoke-test.sh out/ffmpeg-windows-arm64.exe streams outputs
+      - name: The machine it ran on
+        shell: pwsh
+        run: |
+          [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+          [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+      - uses: actions/upload-artifact@v7
+        with:
+          name: outputs-windows-arm64
+          path: outputs
+          if-no-files-found: error
+
   macos:
     needs: prepare
     runs-on: macos-15
@@ -255,7 +385,7 @@ jobs:
   # Every platform's outputs, decoded by a full ffmpeg (the minimal one decodes
   # no H.264 or AAC).
   verify:
-    needs: [linux-x86_64, windows-x86_64, macos]
+    needs: [linux, windows-x86_64, windows-arm64-test, macos]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -275,6 +405,7 @@ jobs:
         run: scripts/verify-outputs.sh streams outputs/*
 
   release:
+    if: inputs.publish && github.ref == 'refs/heads/main'
     needs: [prepare, verify]
     runs-on: ubuntu-24.04
     permissions:
@@ -319,7 +450,8 @@ jobs:
             echo "ffmpeg-NOTICE.txt says what is what, and is the notice nettai ships beside the program."
             echo
             echo '```'
-            (cd release && sha256sum ffmpeg-linux-x86_64 ffmpeg-windows-x86_64.exe ffmpeg-macos-arm64 ffmpeg-macos-x86_64 ffmpeg-NOTICE.txt ./*.tar.*)
+            (cd release && sha256sum ffmpeg-linux-x86_64 ffmpeg-linux-arm64 ffmpeg-windows-x86_64.exe ffmpeg-windows-arm64.exe \
+              ffmpeg-macos-arm64 ffmpeg-macos-x86_64 ffmpeg-NOTICE.txt ./*.tar.*)
             echo '```'
           } > notes.md
           gh release create "$TAG" release/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \

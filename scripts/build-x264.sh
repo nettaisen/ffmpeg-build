@@ -8,6 +8,8 @@
 #                 by scripts/fetch-sources.sh when missing)
 #   BUILD_DIR     where it is unpacked and built (default $PWD/build)
 #   X264_HOST     a host triple to cross-compile for, e.g. x86_64-apple-darwin
+#   X264_CROSS_PREFIX  the cross toolchain's prefix, e.g. aarch64-w64-mingw32-
+#                 (its gcc, ar, ranlib and strip)
 #   EXTRA_CFLAGS, EXTRA_LDFLAGS   added to configure's (architecture, CRT)
 set -euo pipefail
 
@@ -38,6 +40,7 @@ args=(
   --bit-depth=8
 )
 [ -n "${X264_HOST:-}" ] && args+=("--host=${X264_HOST}")
+[ -n "${X264_CROSS_PREFIX:-}" ] && args+=("--cross-prefix=${X264_CROSS_PREFIX}")
 [ -n "${EXTRA_CFLAGS:-}" ] && args+=("--extra-cflags=${EXTRA_CFLAGS}")
 [ -n "${EXTRA_LDFLAGS:-}" ] && args+=("--extra-ldflags=${EXTRA_LDFLAGS}")
 
